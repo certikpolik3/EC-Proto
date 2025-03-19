@@ -1,5 +1,6 @@
 import socket
 import struct
+import os
 from encryption import Encryption
 
 class Transport:
@@ -8,19 +9,34 @@ class Transport:
         self.shared_key = None
 
     def handshake(self, conn):
-        """ Výměna klíčů pomocí ECDH a RSA """
-        # 1. Odeslání veřejného klíče ECDH
-        ec_public_bytes = self.encryption.ec_public_key.public_bytes(
-            encoding=serialization.Encoding.X962,
-            format=serialization.PublicFormat.UncompressedPoint
-        )
-        conn.sendall(struct.pack("H", len(ec_public_bytes)) + ec_public_bytes)
+        """ Zabezpečená výměna klíčů pomocí ECDH a RSA podpisů """
 
-        # 2. Přijetí veřejného klíče od protistrany
+        # 1️⃣ GENERACE NONCE pro ochranu proti replay attackům
+        nonce = os.urandom(16)  # 128bitová náhodná výzva
+        conn.sendall(nonce)
+
+        # 2️⃣ ODESLÁNÍ veřejného klíče ECDH + PODPISU
+        ec_public_bytes = self.encryption.ec_public_key.public_bytes(
+            encoding=self.encryption.serialization.Encoding.X962,
+            format=self.encryption.serialization.PublicFormat.UncompressedPoint
+        )
+        signature = self.encryption.sign_message(ec_public_bytes + nonce)
+
+        conn.sendall(struct.pack("H", len(ec_public_bytes)) + ec_public_bytes)
+        conn.sendall(struct.pack("H", len(signature)) + signature)
+
+        # 3️⃣ PŘIJETÍ veřejného klíče + podpisu druhé strany
         key_length = struct.unpack("H", conn.recv(2))[0]
         peer_public_bytes = conn.recv(key_length)
 
-        # 3. Odvození sdíleného klíče
+        sig_length = struct.unpack("H", conn.recv(2))[0]
+        peer_signature = conn.recv(sig_length)
+
+        # 4️⃣ OVĚŘENÍ podpisu druhé strany
+        if not self.encryption.verify_signature(peer_public_bytes + nonce, peer_signature, self.encryption.rsa_public_key):
+            raise ValueError("Neplatný podpis! Možný MITM útok.")
+
+        # 5️⃣ ODVOZENÍ sdíleného klíče
         self.shared_key = self.encryption.derive_shared_key(peer_public_bytes)
 
     def send_message(self, conn, message):
