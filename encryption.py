@@ -33,14 +33,14 @@ class Encryption:
         return derived_key
 
     def encrypt_message(self, plaintext, shared_key):
-        """ Šifrování zprávy pomocí AES-256 GCM """
+        """ Šifrování pomocí AES-256 GCM """
         nonce = os.urandom(12)  # 96-bit IV
         aesgcm = AESGCM(shared_key)
         ciphertext = aesgcm.encrypt(nonce, plaintext, None)
         return nonce + ciphertext
 
     def decrypt_message(self, encrypted_data, shared_key):
-        """ Dešifrování zprávy pomocí AES-256 GCM """
+        """ Dešifrování pomocí AES-256 GCM """
         nonce = encrypted_data[:12]
         ciphertext = encrypted_data[12:]
         aesgcm = AESGCM(shared_key)
@@ -66,12 +66,3 @@ class Encryption:
             return True
         except:
             return False
-
-    def generate_hmac(self, message, key):
-        """ Generování HMAC pro integritu """
-        return hmac.new(key, message, hashlib.sha256).digest()
-
-    def verify_hmac(self, message, key, received_hmac):
-        """ Ověření HMAC """
-        expected_hmac = self.generate_hmac(message, key)
-        return hmac.compare_digest(expected_hmac, received_hmac)
