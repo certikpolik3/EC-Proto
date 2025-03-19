@@ -1,105 +1,74 @@
-
 import os
-import struct
-import hmac
+import time
 import hashlib
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+import hmac
 from cryptography.hazmat.primitives.asymmetric import ec, rsa, padding
-from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-# RSA-3072 klíčová délka
-RSA_KEY_SIZE = 3072
-AES_KEY_SIZE = 32  # 256 bitů
-AES_GCM_IV_SIZE = 12  # 96 bitů
-HMAC_KEY_SIZE = 32  # 256 bitů
-SALT_SIZE = 16
-MESSAGE_ID_SIZE = 8
-SEQ_NUM_SIZE = 8
+# =========================
+#  ECDH: Forward Secrecy
+# =========================
+def generate_ephemeral_keys():
+    """Vygeneruje krátkodobé (ephemeral) ECDH klíče pro Forward Secrecy."""
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    public_key = private_key.public_key()
+    return private_key, public_key
 
-class Encryption:
-    def __init__(self):
-        """Inicializace: generuje RSA klíče a ECDH klíč."""
-        self.private_key = rsa.generate_private_key(
-            public_exponent=65537, key_size=RSA_KEY_SIZE
-        )
-        self.public_key = self.private_key.public_key()
+def derive_shared_key(private_key, peer_public_key):
+    """Odvodí sdílený klíč pomocí ECDH a HKDF."""
+    shared_secret = private_key.exchange(ec.ECDH(), peer_public_key)
+    derived_key = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=b"DGProto key agreement"
+    ).derive(shared_secret)
+    return derived_key
 
-        self.ecdh_private_key = ec.generate_private_key(ec.SECP256R1())
-        self.shared_secret = None
+# =========================
+#  AES-256-GCM Šifrování
+# =========================
+def encrypt_message(message, key, message_id):
+    """Zašifruje zprávu pomocí AES-256-GCM s ochranou proti Replay útokům."""
+    salt = os.urandom(8)  # 64-bit salt pro ochranu proti replay útokům
+    iv = os.urandom(12)  # 96-bit IV
+    cipher = Cipher(algorithms.AES(key), modes.GCM(iv))
+    encryptor = cipher.encryptor()
+    payload = struct.pack("!Q", message_id) + salt + message
+    ciphertext = encryptor.update(payload) + encryptor.finalize()
+    return iv + encryptor.tag + ciphertext
 
-    def get_public_key(self):
-        """Vrací veřejný klíč RSA a ECDH jako bajty."""
-        return {
-            "rsa": self.public_key.public_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PublicFormat.SubjectPublicKeyInfo
-            ),
-            "ecdh": self.ecdh_private_key.public_key().public_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PublicFormat.SubjectPublicKeyInfo
-            )
-        }
+def decrypt_message(encrypted_data, key, seen_messages):
+    """Dešifruje zprávu a ověří ochranu proti Replay útokům."""
+    iv = encrypted_data[:12]
+    tag = encrypted_data[12:28]
+    ciphertext = encrypted_data[28:]
+    
+    cipher = Cipher(algorithms.AES(key), modes.GCM(iv, tag))
+    decryptor = cipher.decryptor()
+    decrypted_payload = decryptor.update(ciphertext) + decryptor.finalize()
 
-    def derive_shared_secret(self, peer_ecdh_public_bytes):
-        """Vypočítá sdílený tajný klíč pomocí ECDH."""
-        peer_public_key = serialization.load_pem_public_key(peer_ecdh_public_bytes)
-        self.shared_secret = self.ecdh_private_key.exchange(ec.ECDH(), peer_public_key)
+    message_id = struct.unpack("!Q", decrypted_payload[:8])[0]
+    salt = decrypted_payload[8:16]
+    message = decrypted_payload[16:]
 
-    def derive_keys(self, salt):
-        """Odvození AES klíče, IV a HMAC klíče pomocí HKDF."""
-        hkdf = HKDF(
-            algorithm=hashes.SHA256(),
-            length=AES_KEY_SIZE + AES_GCM_IV_SIZE + HMAC_KEY_SIZE,
-            salt=salt,
-            info=b"DGProto Key Derivation"
-        )
-        derived_key = hkdf.derive(self.shared_secret)
-        return {
-            "aes_key": derived_key[:AES_KEY_SIZE],
-            "aes_iv": derived_key[AES_KEY_SIZE:AES_KEY_SIZE + AES_GCM_IV_SIZE],
-            "hmac_key": derived_key[AES_KEY_SIZE + AES_GCM_IV_SIZE:]
-        }
+    # Ověření Replay útoku: zamítnutí zpráv se stejným ID
+    if message_id in seen_messages:
+        raise ValueError("Replay attack detected! Duplicate message ID.")
+    
+    seen_messages.add(message_id)
+    return message
 
-    def encrypt(self, message, keys, salt, msg_id, seq_num):
-        """Šifrování zprávy pomocí AES-256-GCM."""
-        aes_key = keys["aes_key"]
-        aes_iv = keys["aes_iv"]
-        hmac_key = keys["hmac_key"]
+# =========================
+#  HMAC: Ověření integrity
+# =========================
+def generate_hmac(message, key):
+    """Vytvoří HMAC pro ochranu integrity."""
+    return hmac.new(key, message, hashlib.sha256).digest()
 
-        cipher = Cipher(algorithms.AES(aes_key), modes.GCM(aes_iv))
-        encryptor = cipher.encryptor()
-        ciphertext = encryptor.update(message) + encryptor.finalize()
-
-        # Vytvoření HMAC podpisu
-        hmac_obj = hmac.new(hmac_key, ciphertext, hashlib.sha256)
-        mac = hmac_obj.digest()
-
-        # Zabalíme data do binárního formátu
-        return struct.pack(f"!{SALT_SIZE}s{MESSAGE_ID_SIZE}s{SEQ_NUM_SIZE}s{len(ciphertext)}s{len(mac)}s",
-                           salt, msg_id, seq_num, ciphertext, mac)
-
-    def decrypt(self, encrypted_data, keys):
-        """Dešifrování zprávy s ověřením HMAC."""
-        aes_key = keys["aes_key"]
-        aes_iv = keys["aes_iv"]
-        hmac_key = keys["hmac_key"]
-
-        # Rozbalení struktury zprávy
-        salt, msg_id, seq_num, ciphertext, received_mac = struct.unpack(
-            f"!{SALT_SIZE}s{MESSAGE_ID_SIZE}s{SEQ_NUM_SIZE}s{len(encrypted_data)-SALT_SIZE-MESSAGE_ID_SIZE-SEQ_NUM_SIZE}B",
-            encrypted_data
-        )
-
-        # Ověření HMAC
-        hmac_obj = hmac.new(hmac_key, ciphertext, hashlib.sha256)
-        if hmac_obj.digest() != received_mac:
-            raise ValueError("HMAC ověření selhalo!")
-
-        # Dešifrování pomocí AES-256-GCM
-        cipher = Cipher(algorithms.AES(aes_key), modes.GCM(aes_iv))
-        decryptor = cipher.decryptor()
-        decrypted_message = decryptor.update(ciphertext) + decryptor.finalize()
-
-        return decrypted_message
+def verify_hmac(message, key, hmac_value):
+    """Ověří HMAC."""
+    expected_hmac = generate_hmac(message, key)
+    return hmac.compare_digest(expected_hmac, hmac_value)
