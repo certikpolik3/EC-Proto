@@ -10,11 +10,11 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 class Encryption:
     def __init__(self):
-        # Generování ECDH klíče
+        # ECDH klíč pro výměnu
         self.ec_private_key = ec.generate_private_key(ec.SECP256R1())
         self.ec_public_key = self.ec_private_key.public_key()
-        
-        # Generování RSA klíče pro digitální podpisy
+
+        # RSA klíč pro digitální podpisy
         self.rsa_private_key = rsa.generate_private_key(
             public_exponent=65537, key_size=3072
         )
