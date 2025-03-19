@@ -1,74 +1,77 @@
 import os
-import time
-import hashlib
+import struct
 import hmac
-from cryptography.hazmat.primitives.asymmetric import ec, rsa, padding
-from cryptography.hazmat.primitives import hashes
+import hashlib
+from cryptography.hazmat.primitives.asymmetric import rsa, ec
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
 
-# =========================
-#  ECDH: Forward Secrecy
-# =========================
-def generate_ephemeral_keys():
-    """Vygeneruje krátkodobé (ephemeral) ECDH klíče pro Forward Secrecy."""
-    private_key = ec.generate_private_key(ec.SECP256R1())
-    public_key = private_key.public_key()
-    return private_key, public_key
+class Encryption:
+    def __init__(self):
+        # Generování ECDH klíče
+        self.ec_private_key = ec.generate_private_key(ec.SECP256R1())
+        self.ec_public_key = self.ec_private_key.public_key()
+        
+        # Generování RSA klíče pro digitální podpisy
+        self.rsa_private_key = rsa.generate_private_key(
+            public_exponent=65537, key_size=3072
+        )
+        self.rsa_public_key = self.rsa_private_key.public_key()
 
-def derive_shared_key(private_key, peer_public_key):
-    """Odvodí sdílený klíč pomocí ECDH a HKDF."""
-    shared_secret = private_key.exchange(ec.ECDH(), peer_public_key)
-    derived_key = HKDF(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=None,
-        info=b"DGProto key agreement"
-    ).derive(shared_secret)
-    return derived_key
+    def derive_shared_key(self, peer_public_bytes):
+        """ Odvození sdíleného klíče pomocí ECDH """
+        peer_public_key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), peer_public_bytes)
+        shared_secret = self.ec_private_key.exchange(ec.ECDH(), peer_public_key)
 
-# =========================
-#  AES-256-GCM Šifrování
-# =========================
-def encrypt_message(message, key, message_id):
-    """Zašifruje zprávu pomocí AES-256-GCM s ochranou proti Replay útokům."""
-    salt = os.urandom(8)  # 64-bit salt pro ochranu proti replay útokům
-    iv = os.urandom(12)  # 96-bit IV
-    cipher = Cipher(algorithms.AES(key), modes.GCM(iv))
-    encryptor = cipher.encryptor()
-    payload = struct.pack("!Q", message_id) + salt + message
-    ciphertext = encryptor.update(payload) + encryptor.finalize()
-    return iv + encryptor.tag + ciphertext
+        # KDF pro odvození AES-256 klíče
+        derived_key = HKDF(
+            algorithm=hashes.SHA256(), length=32, salt=None, info=b"EMProto Key"
+        ).derive(shared_secret)
 
-def decrypt_message(encrypted_data, key, seen_messages):
-    """Dešifruje zprávu a ověří ochranu proti Replay útokům."""
-    iv = encrypted_data[:12]
-    tag = encrypted_data[12:28]
-    ciphertext = encrypted_data[28:]
-    
-    cipher = Cipher(algorithms.AES(key), modes.GCM(iv, tag))
-    decryptor = cipher.decryptor()
-    decrypted_payload = decryptor.update(ciphertext) + decryptor.finalize()
+        return derived_key
 
-    message_id = struct.unpack("!Q", decrypted_payload[:8])[0]
-    salt = decrypted_payload[8:16]
-    message = decrypted_payload[16:]
+    def encrypt_message(self, plaintext, shared_key):
+        """ Šifrování zprávy pomocí AES-256 GCM """
+        nonce = os.urandom(12)  # 96-bit IV
+        aesgcm = AESGCM(shared_key)
+        ciphertext = aesgcm.encrypt(nonce, plaintext, None)
+        return nonce + ciphertext
 
-    # Ověření Replay útoku: zamítnutí zpráv se stejným ID
-    if message_id in seen_messages:
-        raise ValueError("Replay attack detected! Duplicate message ID.")
-    
-    seen_messages.add(message_id)
-    return message
+    def decrypt_message(self, encrypted_data, shared_key):
+        """ Dešifrování zprávy pomocí AES-256 GCM """
+        nonce = encrypted_data[:12]
+        ciphertext = encrypted_data[12:]
+        aesgcm = AESGCM(shared_key)
+        return aesgcm.decrypt(nonce, ciphertext, None)
 
-# =========================
-#  HMAC: Ověření integrity
-# =========================
-def generate_hmac(message, key):
-    """Vytvoří HMAC pro ochranu integrity."""
-    return hmac.new(key, message, hashlib.sha256).digest()
+    def sign_message(self, message):
+        """ Podepsání zprávy pomocí RSA-3072 """
+        return self.rsa_private_key.sign(
+            message,
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
+            hashes.SHA256()
+        )
 
-def verify_hmac(message, key, hmac_value):
-    """Ověří HMAC."""
-    expected_hmac = generate_hmac(message, key)
-    return hmac.compare_digest(expected_hmac, hmac_value)
+    def verify_signature(self, message, signature, public_key):
+        """ Ověření podpisu zprávy """
+        try:
+            public_key.verify(
+                signature,
+                message,
+                padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
+                hashes.SHA256()
+            )
+            return True
+        except:
+            return False
+
+    def generate_hmac(self, message, key):
+        """ Generování HMAC pro integritu """
+        return hmac.new(key, message, hashlib.sha256).digest()
+
+    def verify_hmac(self, message, key, received_hmac):
+        """ Ověření HMAC """
+        expected_hmac = self.generate_hmac(message, key)
+        return hmac.compare_digest(expected_hmac, received_hmac)
