@@ -40,18 +40,51 @@ class Transport:
         self.shared_key = self.encryption.derive_shared_key(peer_public_bytes)
 
     def send_message(self, conn, message):
-        """ Odeslání šifrované zprávy """
+        """ Odeslání šifrované textové zprávy """
         if self.shared_key is None:
             raise ValueError("Neproběhla výměna klíčů!")
 
-        encrypted_message = self.encryption.encrypt_message(message, self.shared_key)
+        encrypted_message = self.encryption.encrypt_message(message.encode(), self.shared_key)
         conn.sendall(struct.pack("I", len(encrypted_message)) + encrypted_message)
 
     def receive_message(self, conn):
-        """ Přijetí šifrované zprávy """
+        """ Přijetí šifrované textové zprávy """
         if self.shared_key is None:
             raise ValueError("Neproběhla výměna klíčů!")
 
         length = struct.unpack("I", conn.recv(4))[0]
         encrypted_message = conn.recv(length)
-        return self.encryption.decrypt_message(encrypted_message, self.shared_key)
+        return self.encryption.decrypt_message(encrypted_message, self.shared_key).decode()
+
+    def send_file(self, conn, file_path):
+        """ Odeslání šifrovaného souboru """
+        if self.shared_key is None:
+            raise ValueError("Neproběhla výměna klíčů!")
+
+        with open(file_path, "rb") as file:
+            file_data = file.read()
+
+        encrypted_file = self.encryption.encrypt_message(file_data, self.shared_key)
+        file_name = os.path.basename(file_path).encode()
+
+        conn.sendall(struct.pack("H", len(file_name)) + file_name)  # Odeslat název souboru
+        conn.sendall(struct.pack("I", len(encrypted_file)) + encrypted_file)  # Odeslat data
+
+    def receive_file(self, conn, save_path):
+        """ Přijetí šifrovaného souboru """
+        if self.shared_key is None:
+            raise ValueError("Neproběhla výměna klíčů!")
+
+        file_name_length = struct.unpack("H", conn.recv(2))[0]
+        file_name = conn.recv(file_name_length).decode()
+
+        length = struct.unpack("I", conn.recv(4))[0]
+        encrypted_file = conn.recv(length)
+
+        decrypted_file = self.encryption.decrypt_message(encrypted_file, self.shared_key)
+
+        full_path = os.path.join(save_path, file_name)
+        with open(full_path, "wb") as file:
+            file.write(decrypted_file)
+
+        return full_path
