@@ -1,45 +1,41 @@
 import socket
 import struct
-import time
-from encryption import encrypt_message, decrypt_message, generate_hmac, verify_hmac, generate_ephemeral_keys, derive_shared_key
+from encryption import Encryption
 
-class SecureSocket:
-    """Bezpečný šifrovaný socket s Forward Secrecy a ochranou proti Replay útokům."""
-    def __init__(self, sock=None):
-        self.sock = sock if sock else socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.private_key, self.public_key = generate_ephemeral_keys()
+class Transport:
+    def __init__(self):
+        self.encryption = Encryption()
         self.shared_key = None
-        self.seen_messages = set()  # Ochrana proti Replay útokům
 
-    def set_shared_key(self, peer_public_key):
-        """Vytvoří sdílený klíč pomocí ECDH."""
-        self.shared_key = derive_shared_key(self.private_key, peer_public_key)
+    def handshake(self, conn):
+        """ Výměna klíčů pomocí ECDH a RSA """
+        # 1. Odeslání veřejného klíče ECDH
+        ec_public_bytes = self.encryption.ec_public_key.public_bytes(
+            encoding=serialization.Encoding.X962,
+            format=serialization.PublicFormat.UncompressedPoint
+        )
+        conn.sendall(struct.pack("H", len(ec_public_bytes)) + ec_public_bytes)
 
-    def send_secure(self, data):
-        """Zašifruje a odešle data se HMAC ochranou a ochranou proti Replay útokům."""
-        if not self.shared_key:
-            raise ValueError("Shared key not set!")
+        # 2. Přijetí veřejného klíče od protistrany
+        key_length = struct.unpack("H", conn.recv(2))[0]
+        peer_public_bytes = conn.recv(key_length)
 
-        message_id = int(time.time() * 1000)  # Unikátní ID zprávy (timestamp v ms)
-        encrypted_data = encrypt_message(data, self.shared_key, message_id)
-        hmac_value = generate_hmac(encrypted_data, self.shared_key)
+        # 3. Odvození sdíleného klíče
+        self.shared_key = self.encryption.derive_shared_key(peer_public_bytes)
 
-        # Serializace binárních dat: délka + HMAC + zašifrovaná data
-        packet = struct.pack(f"!Q32s{len(encrypted_data)}s", message_id, hmac_value, encrypted_data)
-        self.sock.sendall(packet)
+    def send_message(self, conn, message):
+        """ Odeslání šifrované zprávy """
+        if self.shared_key is None:
+            raise ValueError("Neproběhla výměna klíčů!")
 
-    def recv_secure(self):
-        """Přijme a dešifruje data, ověří HMAC a ochranu proti Replay útokům."""
-        length_data = self.sock.recv(8)  # 64-bit ID zprávy
-        if not length_data:
-            return None
-        
-        message_id = struct.unpack("!Q", length_data)[0]
-        packet = self.sock.recv(32 + 1024)  # HMAC + zašifrovaná data
+        encrypted_message = self.encryption.encrypt_message(message, self.shared_key)
+        conn.sendall(struct.pack("I", len(encrypted_message)) + encrypted_message)
 
-        hmac_value, encrypted_data = struct.unpack(f"!32s{len(packet) - 32}s", packet)
-        
-        if not verify_hmac(encrypted_data, self.shared_key, hmac_value):
-            raise ValueError("HMAC ověření selhalo!")
+    def receive_message(self, conn):
+        """ Přijetí šifrované zprávy """
+        if self.shared_key is None:
+            raise ValueError("Neproběhla výměna klíčů!")
 
-        return decrypt_message(encrypted_data, self.shared_key, self.seen_messages)
+        length = struct.unpack("I", conn.recv(4))[0]
+        encrypted_message = conn.recv(length)
+        return self.encryption.decrypt_message(encrypted_message, self.shared_key)
